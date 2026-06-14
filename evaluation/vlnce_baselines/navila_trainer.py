@@ -1,6 +1,8 @@
 import copy
+import gzip
 import gc
 import json
+import math
 import os
 import random
 import re
@@ -64,6 +66,31 @@ class NaVILATrainer(BaseVLNCETrainer):
         if self.config.EVAL.SAVE_RESULTS:
             self._make_results_dir()
 
+    @staticmethod
+    def _atomic_write_json(path: str, data: dict) -> None:
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(data, f, indent=4)
+        os.replace(tmp_path, path)
+
+    @staticmethod
+    def _chunk_episode_ids(dataset_config) -> list:
+        dataset_filename = dataset_config.DATA_PATH.format(split=dataset_config.SPLIT)
+        with gzip.open(dataset_filename, "rt") as f:
+            episodes = json.load(f)["episodes"]
+
+        chunk_size = math.ceil(len(episodes) / dataset_config.NUM_CHUNKS)
+        start = dataset_config.CHUNK_IDX * chunk_size
+        end = min(len(episodes), start + chunk_size)
+        episode_ids = [str(ep["episode_id"]) for ep in episodes[start:end]]
+
+        allowed_ids = [str(ep_id) for ep_id in dataset_config.EPISODES_ALLOWED]
+        if "*" not in allowed_ids:
+            allowed_ids = set(allowed_ids)
+            episode_ids = [ep_id for ep_id in episode_ids if ep_id in allowed_ids]
+
+        return episode_ids
+
     def train(self) -> None:
         raise NotImplementedError
 
@@ -107,24 +134,46 @@ class NaVILATrainer(BaseVLNCETrainer):
         if len(config.VIDEO_OPTION) > 0:
             config.TASK_CONFIG.TASK.MEASUREMENTS.append("TOP_DOWN_MAP_VLNCE")
 
-        config.freeze()
-
+        fname = None
+        stats_episodes = {}
         if config.EVAL.SAVE_RESULTS:
             fname = os.path.join(
                 config.RESULTS_DIR,
                 f"{split}_{self.num_chunks}-{self.chunk_idx}.json",
             )
+            all_episode_ids = self._chunk_episode_ids(config.TASK_CONFIG.DATASET)
+            if config.EVAL.EPISODE_COUNT > -1:
+                all_episode_ids = all_episode_ids[: config.EVAL.EPISODE_COUNT]
+
             if os.path.exists(fname):
-                logger.info("skipping -- evaluation exists.")
-                return
+                with open(fname) as f:
+                    loaded_stats = json.load(f)
+
+                all_episode_ids_set = set(all_episode_ids)
+                stats_episodes = {
+                    str(ep_id): ep_stats
+                    for ep_id, ep_stats in loaded_stats.items()
+                    if str(ep_id) in all_episode_ids_set
+                }
+
+                completed_ids = set(stats_episodes)
+                if completed_ids >= all_episode_ids_set:
+                    logger.info("skipping -- evaluation exists.")
+                    return
+
+                remaining_ids = [ep_id for ep_id in all_episode_ids if ep_id not in completed_ids]
+                logger.info(
+                    f"resuming evaluation: {len(completed_ids)} completed, {len(remaining_ids)} remaining"
+                )
+                config.TASK_CONFIG.DATASET.EPISODES_ALLOWED = remaining_ids
+
+        config.freeze()
 
         envs = construct_envs_auto_reset_false(config, get_env_class(config.ENV_NAME))
         observations = envs.reset()
         observations = extract_instruction_tokens(observations, self.config.TASK_CONFIG.TASK.INSTRUCTION_SENSOR_UUID)
         batch = batch_obs(observations, self.device)
         batch = apply_obs_transforms_batch(batch, self.obs_transforms)
-
-        stats_episodes = {}
 
         past_rgbs = [[] for _ in range(envs.num_envs)]
         rgb_frames = [[] for _ in range(envs.num_envs)]  # this is for visualization, contains text and map
@@ -135,6 +184,7 @@ class NaVILATrainer(BaseVLNCETrainer):
         num_eps = sum(envs.number_of_episodes)
         if config.EVAL.EPISODE_COUNT > -1:
             num_eps = min(config.EVAL.EPISODE_COUNT, num_eps)
+        target_num_eps = len(stats_episodes) + num_eps
 
         pbar = tqdm.tqdm(total=num_eps) if config.use_pbar else None
         log_str = (
@@ -146,7 +196,7 @@ class NaVILATrainer(BaseVLNCETrainer):
 
         queue_actions = []
 
-        while envs.num_envs > 0 and len(stats_episodes) < num_eps:
+        while envs.num_envs > 0 and len(stats_episodes) < target_num_eps:
 
             current_episodes = envs.current_episodes()
 
@@ -307,7 +357,7 @@ class NaVILATrainer(BaseVLNCETrainer):
                     logger.info(
                         log_str.format(
                             evaluated=len(stats_episodes),
-                            total=num_eps,
+                            total=target_num_eps,
                             time=round(time.time() - start_time),
                         )
                     )
@@ -324,6 +374,9 @@ class NaVILATrainer(BaseVLNCETrainer):
                     )
                     del stats_episodes[ep_id]["top_down_map_vlnce"]
                     rgb_frames[i] = []
+
+                if config.EVAL.SAVE_RESULTS:
+                    self._atomic_write_json(fname, stats_episodes)
 
             observations = extract_instruction_tokens(
                 observations,
@@ -351,8 +404,7 @@ class NaVILATrainer(BaseVLNCETrainer):
             pbar.close()
 
         if config.EVAL.SAVE_RESULTS:
-            with open(fname, "w") as f:
-                json.dump(stats_episodes, f, indent=4)
+            self._atomic_write_json(fname, stats_episodes)
 
     @staticmethod
     def _pause_envs(
