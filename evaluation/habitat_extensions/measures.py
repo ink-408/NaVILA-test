@@ -4,8 +4,6 @@ import pickle
 from typing import Any, List, Union
 
 import numpy as np
-from dtw import dtw
-from fastdtw import fastdtw
 from habitat.config import Config
 from habitat.core.dataset import Episode
 from habitat.core.embodied_task import Action, EmbodiedTask, Measure
@@ -210,7 +208,6 @@ class NDTW(Measure):
     def __init__(self, *args: Any, sim: Simulator, config: Config, **kwargs: Any):
         self._sim = sim
         self._config = config
-        self.dtw_func = fastdtw if config.FDTW else dtw
 
         if "{role}" in config.GT_PATH:
             self.gt_json = {}
@@ -228,8 +225,35 @@ class NDTW(Measure):
 
     def reset_metric(self, *args: Any, episode, **kwargs: Any):
         self.locations = []
-        self.gt_locations = self.gt_json[episode.episode_id]["locations"]
+        self.gt_locations = np.asarray(self.gt_json[episode.episode_id]["locations"], dtype=np.float64)
+        self._dtw_prev_row = None
         self.update_metric()
+
+    def _update_dtw_distance(self, current_position: List[float]) -> float:
+        """Incrementally compute exact DTW distance for the growing agent path.
+
+        The original fastdtw package can segfault in this old Habitat/VLN-CE
+        stack. Keeping the dynamic-programming frontier avoids that native
+        extension and costs only one GT-path pass per simulator step.
+        """
+        gt_locations = self.gt_locations
+        if len(gt_locations) == 0:
+            return 0.0
+
+        previous = self._dtw_prev_row
+        if previous is None:
+            previous = np.full(len(gt_locations) + 1, np.inf, dtype=np.float64)
+            previous[0] = 0.0
+
+        current = np.full(len(gt_locations) + 1, np.inf, dtype=np.float64)
+        position = np.asarray(current_position, dtype=np.float64)
+        costs = np.linalg.norm(gt_locations - position, axis=1)
+
+        for j, cost in enumerate(costs, start=1):
+            current[j] = cost + min(previous[j], current[j - 1], previous[j - 1])
+
+        self._dtw_prev_row = current
+        return float(current[-1])
 
     def update_metric(self, *args: Any, **kwargs: Any):
         current_position = self._sim.get_agent_state().position.tolist()
@@ -240,7 +264,7 @@ class NDTW(Measure):
                 return
             self.locations.append(current_position)
 
-        dtw_distance = self.dtw_func(self.locations, self.gt_locations, dist=euclidean_distance)[0]
+        dtw_distance = self._update_dtw_distance(current_position)
 
         nDTW = np.exp(-dtw_distance / (len(self.gt_locations) * self._config.SUCCESS_DISTANCE))
         self._metric = nDTW

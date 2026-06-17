@@ -38,14 +38,11 @@ from llava.model.builder import load_pretrained_model
 
 
 def sample_and_pad_images(images, num_frames=8, width=512, height=512):
-    frames = copy.deepcopy(images)
+    frames = list(images)
 
     if len(frames) < num_frames:
-        padding_frames = num_frames - len(frames)
         while len(frames) < num_frames:
             frames.insert(0, Image.new("RGB", (width, height), color=(0, 0, 0)))
-    else:
-        padding_frames = 0
 
     latest_frame = frames[-1]
     sampled_indices = np.linspace(0, len(frames) - 1, num=num_frames - 1, endpoint=False, dtype=int)
@@ -241,7 +238,7 @@ class NaVILATrainer(BaseVLNCETrainer):
                     input_ids = (
                         tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt")
                         .unsqueeze(0)
-                        .cuda()
+                        .to(model.device)
                     )
 
                     stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
@@ -251,7 +248,7 @@ class NaVILATrainer(BaseVLNCETrainer):
                     with torch.inference_mode():
                         output_ids = model.generate(
                             input_ids,
-                            images=images_tensor.half().cuda(),
+                            images=images_tensor,
                             do_sample=False,
                             temperature=0.0,
                             max_new_tokens=32,
@@ -281,12 +278,9 @@ class NaVILATrainer(BaseVLNCETrainer):
                         for action, pattern in patterns.items():
                             if pattern.search(s):
                                 return action
-                        return None  # Return None if no match is found
+                        return 1
 
-                    try:
-                        actions = [map_string_to_action(outputs)]
-                    except:
-                        actions = [1]
+                    actions = [map_string_to_action(outputs)]
                     print(actions)
 
                 if actions[0] == 1:
